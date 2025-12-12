@@ -14,7 +14,6 @@ class AudienceAnalyzer:
         }
     
     def extract_age(self, bdate: str) -> Optional[int]:
-        """Извлекает возраст из даты рождения"""
         if not bdate:
             return None
             
@@ -35,7 +34,6 @@ class AudienceAnalyzer:
         return None
     
     def categorize_interests(self, user: Dict) -> List[str]:
-        """Категоризирует интересы пользователя"""
         interests = []
         fields = ['interests', 'activities', 'books', 'music', 'movies', 'games']
         
@@ -47,7 +45,6 @@ class AudienceAnalyzer:
         return list(set(interests))
     
     async def analyze_audience(self, members: List[Dict]) -> Dict[str, Any]:
-        """Анализирует аудиторию группы"""
         if not members:
             return {}
         
@@ -61,9 +58,7 @@ class AudienceAnalyzer:
             'recommendations': []
         }
         
-        # Сбор данных
         for member in members:
-            # Гендер
             sex = member.get('sex', 0)
             if sex == 2:
                 analysis['gender']['male'] += 1
@@ -72,7 +67,6 @@ class AudienceAnalyzer:
             else:
                 analysis['gender']['unknown'] += 1
             
-            # Возраст
             age = self.extract_age(member.get('bdate', ''))
             if age:
                 for group, (min_age, max_age) in self.age_groups.items():
@@ -80,17 +74,14 @@ class AudienceAnalyzer:
                         analysis['age_groups'][group] += 1
                         break
             
-            # Город
             city = member.get('city', {}).get('title')
             if city:
                 analysis['cities'][city] += 1
             
-            # Интересы
             interests = self.categorize_interests(member)
             for interest in interests:
                 analysis['interests'][interest] += 1
         
-        # Преобразование в проценты
         if total > 0:
             for key in analysis['gender']:
                 analysis['gender'][key] = round(analysis['gender'][key] / total * 100, 1)
@@ -98,59 +89,48 @@ class AudienceAnalyzer:
             for group in analysis['age_groups']:
                 analysis['age_groups'][group] = round(analysis['age_groups'][group] / total * 100, 1)
             
-            # Топ 10 городов
             top_cities = dict(analysis['cities'].most_common(10))
             analysis['cities'] = {city: round(count / total * 100, 1) for city, count in top_cities.items()}
             
-            # Топ 20 интересов
             top_interests = dict(analysis['interests'].most_common(20))
             analysis['interests'] = top_interests
         
-        # Генерация рекомендаций
         analysis['recommendations'] = self._generate_recommendations(analysis)
         
         return analysis
     
     def _generate_recommendations(self, analysis: Dict) -> List[str]:
-        """Генерирует рекомендации для таргетированной рекламы"""
         recommendations = []
         
-        # Рекомендации по полу
         if analysis['gender']['male'] > 70:
             recommendations.append("Аудитория преимущественно мужская - используйте мужские образы в рекламе")
         elif analysis['gender']['female'] > 70:
             recommendations.append("Аудитория преимущественно женская - адаптируйте контент под женскую аудиторию")
         
-        # Рекомендации по возрасту
         main_age_group = max(analysis['age_groups'].items(), key=lambda x: x[1])
         if main_age_group[1] > 40:
             recommendations.append(f"Основная возрастная группа: {main_age_group[0]} - используйте соответствующий язык и референсы")
         
-        # Рекомендации по географии
         if analysis['cities']:
             top_city = list(analysis['cities'].keys())[0]
             if analysis['cities'][top_city] > 30:
                 recommendations.append(f"Аудитория сконцентрирована в {top_city} - используйте геотаргетинг")
         
-        # Рекомендации по интересам
         if analysis['interests']:
             top_interests = list(analysis['interests'].keys())[:3]
             recommendations.append(f"Популярные интересы: {', '.join(top_interests)} - обыгрывайте их в креативах")
         
-        return recommendations[:5]  # Ограничиваем 5 рекомендациями
+        return recommendations[:5]
     
-    async def compare_audiences(self, analysis1: Dict, analysis2: Dict) -> Dict[str, Any]:
-        """Сравнивает две аудитории"""
+    async def compare_audiences(self, analysis1: Dict[str, Any], analysis2: Dict[str, Any]) -> Dict[str, Any]:
         similarity_score = 0
         common_characteristics = []
         
-        # Сравнение демографии
         gender_diff = abs(analysis1['gender']['male'] - analysis2['gender']['male'])
         if gender_diff < 10:
             similarity_score += 25
             common_characteristics.append("Схожее гендерное распределение")
         
-        # Сравнение возрастных групп
         age_similarity = 0
         for group in analysis1['age_groups']:
             diff = abs(analysis1['age_groups'][group] - analysis2['age_groups'][group])
@@ -161,7 +141,6 @@ class AudienceAnalyzer:
             similarity_score += 25
             common_characteristics.append("Схожие возрастные группы")
         
-        # Сравнение городов
         cities1 = set(analysis1['cities'].keys())
         cities2 = set(analysis2['cities'].keys())
         common_cities = cities1.intersection(cities2)
@@ -169,7 +148,6 @@ class AudienceAnalyzer:
             similarity_score += 25
             common_characteristics.append(f"Общие города: {', '.join(list(common_cities)[:3])}")
         
-        # Сравнение интересов
         interests1 = set(analysis1['interests'].keys())
         interests2 = set(analysis2['interests'].keys())
         common_interests = interests1.intersection(interests2)
