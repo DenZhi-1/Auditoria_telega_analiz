@@ -410,55 +410,45 @@ async def cmd_stats(message: Message):
 
 @dp.message(Command("test_vk"))
 async def cmd_test_vk(message: Message):
+    """Тестирование подключения к VK API (только для администраторов)"""
+    # Проверка прав администратора
     if message.from_user.id not in config.ADMIN_IDS:
-        await message.answer("❌ Эта команда только для администраторов")
+        await message.answer(
+            "❌ <b>Эта команда доступна только администраторам</b>\n\n"
+            f"Ваш ID: {message.from_user.id}\n"
+            f"Администраторы: {', '.join(map(str, config.ADMIN_IDS))}"
+        )
         return
     
-    await message.answer("🔍 <b>Запускаю диагностику подключения к VK API...</b>")
+    await message.answer("🔍 <b>Запускаю тестирование подключения к VK API...</b>")
     
     try:
         result = await vk_client.test_connection()
         
-        report = f"<b>РЕЗУЛЬТАТЫ ДИАГНОСТИКИ VK API</b>\n\n"
-        report += f"{result['message']}\n\n"
-        
-        if 'details' in result:
-            report += "<b>Подробности тестов:</b>\n"
-            for detail in result['details']:
-                status = "✅" if detail['success'] else "❌"
-                # Убираем лишние переносы строк для читаемости в Telegram
-                message_text = detail['message'].replace('\n', ' ')
-                report += f"{status} <b>{detail['test']}:</b> {message_text}\n"
-        
-        report += f"\n<b>Текущая конфигурация:</b>\n"
-        report += f"• API Версия: {config.VK_API_VERSION}\n"
-        report += f"• Токен: {'✅ Установлен' if config.VK_SERVICE_TOKEN else '❌ Отсутствует'}\n"
-        report += f"• Задержка: {config.REQUEST_DELAY:.2f}с между запросами\n"
-        
-        await message.answer(report)
-        
-        # Дополнительные рекомендации
-        if not result['success'] or '❌' in report:
-            await message.answer(
-                "<b>🚨 РЕКОМЕНДАЦИИ ПО УСТРАНЕНИЮ ПРОБЛЕМ:</b>\n\n"
-                "1. <b>Проверьте токен VK</b> в настройках Railway\n"
-                "2. <b>Убедитесь</b>, что токен имеет права доступа к группам\n"
-                "3. <b>Попробуйте создать</b> новый сервисный ключ в VK\n"
-                "4. <b>Проверьте</b>, что приложение VK активировано\n\n"
-                "<i>Для теста используйте группы с числовыми ID:</i>\n"
-                "<code>/analyze https://vk.com/public1</code>\n"
-                "<code>/analyze https://vk.com/club1</code>"
-            )
-        
-    except Exception as e:
-        logger.error(f"Ошибка диагностики VK: {e}", exc_info=True)
-        await message.answer(f"❌ <b>Критическая ошибка диагностики:</b>\n\n{str(e)[:200]}")
+        if result['success']:
+            report = "✅ <b>ТЕСТИРОВАНИЕ ПРОЙДЕНО УСПЕШНО</b>\n\n"
+            report += f"{result['message']}\n\n"
+            
+            if 'details' in result:
+                report += "<b>Детали тестов:</b>\n"
+                for detail in result['details']:
+                    status = "✅" if detail['success'] else "❌"
+                    # Убираем лишние переносы строк для читаемости в Telegram
+                    message_text = detail['message'].replace('\n', ' ')
+                    report += f"{status} <b>{detail['test']}:</b> {message_text}\n"
+            
+            report += f"\n<b>Конфигурация VK API:</b>\n"
+            report += f"• Версия API: {config.VK_API_VERSION}\n"
+            report += f"• Задержка между запросами: {config.REQUEST_DELAY:.2f}с\n"
+            report += f"• Токен: {'✅ Установлен' if config.VK_SERVICE_TOKEN else '❌ Отсутствует'}\n"
+            
+            await message.answer(report)
             
             # Предложение протестировать на реальной группе
             await message.answer(
                 "💡 <b>Проверьте работу на реальной группе:</b>\n"
-                "<code>/analyze https://vk.com/durov</code>\n"
-                "Или: <code>/analyze vk.com/public1</code>"
+                "<code>/analyze https://vk.com/public1</code>\n"
+                "Или: <code>/analyze https://vk.com/club1</code>"
             )
             
         else:
@@ -469,7 +459,8 @@ async def cmd_test_vk(message: Message):
                 report += "<b>Результаты тестов:</b>\n"
                 for detail in result['details']:
                     status = "✅" if detail['success'] else "❌"
-                    report += f"{status} {detail['test']}: {detail['message']}\n"
+                    message_text = detail['message'].replace('\n', ' ')
+                    report += f"{status} <b>{detail['test']}:</b> {message_text}\n"
             
             report += "\n<b>Возможные причины:</b>\n"
             report += "1. Неверный или просроченный VK_SERVICE_TOKEN\n"
@@ -488,7 +479,7 @@ async def cmd_test_vk(message: Message):
         logger.error(f"Ошибка тестирования VK: {e}", exc_info=True)
         await message.answer(
             f"❌ <b>Критическая ошибка тестирования:</b>\n\n"
-            f"{str(e)}\n\n"
+            f"{str(e)[:200]}\n\n"
             "<i>Проверьте логи бота для подробной информации.</i>"
         )
 
@@ -545,6 +536,9 @@ async def main():
         
         logger.info("Бот остановлен")
         logger.info("=" * 60)
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
 if __name__ == "__main__":
     asyncio.run(main())
