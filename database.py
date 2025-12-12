@@ -1,15 +1,14 @@
-import json
+import logging
 from datetime import datetime
-from typing import Dict, List, Optional
-import aiosqlite
-import asyncpg
+from typing import Dict, List, Optional, Any
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
-from sqlalchemy import Column, Integer, String, JSON, DateTime, Text
+from sqlalchemy import Column, Integer, String, JSON, DateTime, Text, select
 import sqlalchemy
 
 from config import config
 
+logger = logging.getLogger(__name__)
 Base = declarative_base()
 
 class AnalysisResult(Base):
@@ -34,87 +33,146 @@ class Database:
     def __init__(self):
         self.engine = None
         self.async_session = None
+    
+    def _normalize_db_url(self, db_url: str) -> str:
+        """Нормализация URL базы данных для SQLAlchemy"""
+        if not db_url:
+            logger.warning("DATABASE_URL пустой, используется SQLite")
+            return "sqlite+aiosqlite:///database.db"
         
-    async def init_db(self):
-        if config.DATABASE_URL.startswith('postgresql'):
+        # Railway часто использует postgres:// вместо postgresql://
+        if db_url.startswith("postgres://"):
+            db_url = db_url.replace("postgres://", "postgresql+asyncpg://", 1)
+            logger.info("Конвертирован postgres:// в postgresql+asyncpg://")
+        elif db_url.startswith("postgresql://"):
+            db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        
+        # Если URL указывает на localhost, используем SQLite для Railway
+        if "localhost" in db_url or "127.0.0.1" in db_url or "::1" in db_url:
+            logger.warning(f"Обнаружен localhost в DATABASE_URL, используется SQLite")
+            return "sqlite+aiosqlite:///database.db"
+        
+        return db_url
+    
+    async def init_db(self) -> bool:
+        """Инициализация подключения к базе данных"""
+        try:
+            db_url = self._normalize_db_url(config.DATABASE_URL)
+            logger.info(f"Инициализация БД с URL: {db_url[:50]}...")
+            
             self.engine = create_async_engine(
-                config.DATABASE_URL.replace('postgresql://', 'postgresql+asyncpg://'),
+                db_url,
+                echo=False,
+                pool_size=10,
+                max_overflow=20,
+                pool_pre_ping=True
+            )
+            
+            self.async_session = sessionmaker(
+                self.engine,
+                class_=AsyncSession,
+                expire_on_commit=False
+            )
+            
+            # Создание таблиц
+            async with self.engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            
+            # Тестовое подключение
+            async with self.async_session() as session:
+                await session.execute(select(1))
+            
+            logger.info("База данных успешно инициализирована")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка инициализации базы данных: {e}")
+            # В случае ошибки создаем in-memory SQLite для продолжения работы
+            logger.info("Создается in-memory SQLite база для продолжения работы")
+            self.engine = create_async_engine(
+                "sqlite+aiosqlite:///:memory:",
                 echo=False
             )
-        else:
-            self.engine = create_async_engine(
-                'sqlite+aiosqlite:///database.db',
-                echo=False
+            self.async_session = sessionmaker(
+                self.engine,
+                class_=AsyncSession,
+                expire_on_commit=False
             )
-        
-        self.async_session = sessionmaker(
-            self.engine, class_=AsyncSession, expire_on_commit=False
-        )
-        
-        async with self.engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+            
+            async with self.engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            
+            return False
     
-    async def save_analysis(self, user_id: int, group_id: str, group_name: str, analysis: Dict):
-        async with self.async_session() as session:
-            analysis_record = AnalysisResult(
-                user_id=user_id,
-                group_id=group_id,
-                group_name=group_name,
-                analysis_data=analysis
-            )
-            session.add(analysis_record)
-            
-            stats = await session.get(UserStats, user_id)
-            if not stats:
-                stats = UserStats(user_id=user_id)
-                session.add(stats)
-            
-            stats.total_analyses += 1
-            stats.last_activity = datetime.utcnow()
-            
-            await session.commit()
+    async def save_analysis(self, user_id: int, group_id: str, 
+                           group_name: str, analysis: Dict[str, Any]) -> bool:
+        """Сохранение результата анализа в базу данных"""
+        try:
+            async with self.async_session() as session:
+                analysis_record = AnalysisResult(
+                    user_id=user_id,
+                    group_id=group_id,
+                    group_name=group_name,
+                    analysis_data=analysis
+                )
+                session.add(analysis_record)
+                
+                # Обновление статистики пользователя
+                stats = await session.get(UserStats, user_id)
+                if not stats:
+                    stats = UserStats(user_id=user_id)
+                    session.add(stats)
+                
+                stats.total_analyses += 1
+                stats.last_activity = datetime.utcnow()
+                
+                await session.commit()
+                return True
+                
+        except Exception as e:
+            logger.error(f"Ошибка сохранения анализа: {e}")
+            return False
     
-    async def get_user_stats(self, user_id: int) -> Dict:
-        async with self.async_session() as session:
-            stats = await session.get(UserStats, user_id)
-            if not stats:
-                return {'total_analyses': 0, 'saved_reports': 0}
-            
-            result = await session.execute(
-                sqlalchemy.select(AnalysisResult)
-                .where(AnalysisResult.user_id == user_id)
-                .order_by(AnalysisResult.created_at.desc())
-                .limit(5)
-            )
-            last_analyses = result.scalars().all()
-            
-            return {
-                'total_analyses': stats.total_analyses,
-                'saved_reports': stats.saved_reports,
-                'last_analyses': [
-                    {
-                        'group_name': a.group_name,
-                        'created_at': a.created_at
-                    } for a in last_analyses
-                ]
-            }
+    async def get_user_stats(self, user_id: int) -> Dict[str, Any]:
+        """Получение статистики пользователя"""
+        try:
+            async with self.async_session() as session:
+                stats = await session.get(UserStats, user_id)
+                
+                if not stats:
+                    return {
+                        'total_analyses': 0,
+                        'saved_reports': 0,
+                        'last_analyses': []
+                    }
+                
+                # Получение последних анализов
+                query = select(AnalysisResult).where(
+                    AnalysisResult.user_id == user_id
+                ).order_by(
+                    AnalysisResult.created_at.desc()
+                ).limit(3)
+                
+                result = await session.execute(query)
+                last_analyses = result.scalars().all()
+                
+                return {
+                    'total_analyses': stats.total_analyses,
+                    'saved_reports': stats.saved_reports,
+                    'last_analyses': [
+                        {
+                            'group_name': a.group_name,
+                            'created_at': a.created_at.strftime('%d.%m.%Y %H:%M')
+                        } for a in last_analyses
+                    ]
+                }
+                
+        except Exception as e:
+            logger.error(f"Ошибка получения статистики: {e}")
+            return {'total_analyses': 0, 'saved_reports': 0, 'last_analyses': []}
     
-    async def get_analysis_history(self, user_id: int, limit: int = 10) -> List[Dict]:
-        async with self.async_session() as session:
-            result = await session.execute(
-                sqlalchemy.select(AnalysisResult)
-                .where(AnalysisResult.user_id == user_id)
-                .order_by(AnalysisResult.created_at.desc())
-                .limit(limit)
-            )
-            analyses = result.scalars().all()
-            
-            return [
-                {
-                    'id': a.id,
-                    'group_name': a.group_name,
-                    'group_id': a.group_id,
-                    'created_at': a.created_at,
-                    'analysis': a.analysis_data
-                } for a in analyses
-            ]
+    async def close(self):
+        """Корректное закрытие соединений с базой данных"""
+        if self.engine:
+            await self.engine.dispose()
+            logger.info("Соединения с базой данных закрыты")
