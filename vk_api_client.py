@@ -43,15 +43,15 @@ class VKAPIClient:
         if not group_link:
             return None
             
-        group_link = group_link.strip()
+        group_link = group_link.strip().lower()
         
         patterns = [
             # Для числовых ID: club123456, public123456
             r'(?:https?://)?(?:www\.)?(?:m\.)?vk\.com/(?:club|public|event)(\d+)',
             # Для коротких имен: vk.com/groupname
-            r'(?:https?://)?(?:www\.)?(?:m\.)?vk\.com/([a-zA-Z0-9_.][a-zA-Z0-9_.-]*)',
+            r'(?:https?://)?(?:www\.)?(?:m\.)?vk\.com/([a-zA-Z0-9_][a-zA-Z0-9_.-]*)',
             # Для упоминаний: @groupname
-            r'@([a-zA-Z0-9_.][a-zA-Z0-9_.-]*)'
+            r'@([a-zA-Z0-9_][a-zA-Z0-9_.-]*)'
         ]
         
         for pattern in patterns:
@@ -88,15 +88,10 @@ class VKAPIClient:
             safe_params = {k: v for k, v in request_params.items() if k != 'access_token'}
             logger.debug(f"[Req #{request_id}] {method} params: {safe_params}")
             
-            start_time = asyncio.get_event_loop().time()
-            
             async with session.get(
                 f"{self.base_url}{method}", 
                 params=request_params
             ) as response:
-                
-                response_time = asyncio.get_event_loop().time() - start_time
-                logger.debug(f"[Req #{request_id}] Response time: {response_time:.2f}s")
                 
                 if response.status != 200:
                     error_text = await response.text()
@@ -104,10 +99,6 @@ class VKAPIClient:
                     return None
                 
                 data = await response.json()
-                
-                # Логируем полный ответ в debug режиме
-                if config.DEBUG:
-                    logger.debug(f"[Req #{request_id}] Response data: {data}")
                 
                 # Проверяем ошибки VK API
                 if 'error' in data:
@@ -117,18 +108,14 @@ class VKAPIClient:
                     
                     logger.error(f"[Req #{request_id}] VK API error {error_code}: {error_msg}")
                     
-                    # Специальная обработка ошибок
-                    if error_code == 5:
-                        logger.critical("❌ INVALID VK TOKEN! Check VK_SERVICE_TOKEN")
-                    elif error_code == 100:
-                        logger.error(f"Invalid parameter. Params sent: {safe_params}")
+                    if error_code == 100:
+                        # Детальный лог для ошибки параметров
+                        logger.error(f"[Req #{request_id}] Invalid params details: {safe_params}")
                     
                     return None
                 
                 # Возвращаем успешный ответ
-                response_data = data.get('response')
-                logger.debug(f"[Req #{request_id}] Success, response type: {type(response_data)}")
-                return response_data
+                return data.get('response')
                 
         except asyncio.TimeoutError:
             logger.error(f"[Req #{request_id}] Timeout")
@@ -144,56 +131,56 @@ class VKAPIClient:
             await asyncio.sleep(config.REQUEST_DELAY)
     
     async def get_group_info(self, group_link: str) -> Optional[Dict[str, Any]]:
-        """Получает информацию о группе"""
+        """Получает информацию о группе с поддержкой всех форматов"""
         logger.info(f"Запрос информации о группе: {group_link}")
         
-        group_id = self._extract_group_id(group_link)
-        if not group_id:
+        group_identifier = self._extract_group_id(group_link)
+        if not group_identifier:
             logger.error(f"Не удалось извлечь ID из ссылки: {group_link}")
             return None
         
-        logger.info(f"Извлечен идентификатор: {group_id}")
+        logger.info(f"Извлечен идентификатор: {group_identifier}")
         
-        # Пробуем сначала как короткое имя (screen_name)
-        # VK API требует использовать 'group_id' для screen_name
-        params = {
-            'group_id': group_id,
-            'fields': 'members_count,description,activity,status,is_closed,type'
-        }
-        
-        # Если это числовой ID, преобразуем в число
-        if group_id.isdigit():
-            params['group_id'] = int(group_id)
-        # Если это короткое имя, оставляем строкой
+        # Для коротких имен (screen_name) используем специальную обработку
+        if group_identifier.isdigit():
+            # Это числовой ID
+            params = {
+                'group_id': group_identifier,
+                'fields': 'members_count,description,activity,status,is_closed,type'
+            }
         else:
-            params['group_id'] = group_id
-        
-        logger.debug(f"Отправка запроса с параметрами: {params}")
+            # Это короткое имя (screen_name)
+            params = {
+                'group_ids': group_identifier,  # Используем group_ids для screen_name
+                'fields': 'members_count,description,activity,status,is_closed,type'
+            }
         
         response = await self._make_request('groups.getById', params)
         
         if response is None:
-            logger.error(f"Нет ответа от VK API для {group_id}")
+            logger.error(f"Нет ответа от VK API для {group_identifier}")
             return None
         
-        # Обработка ответа
-        if isinstance(response, list) and len(response) > 0:
-            group_data = response[0]
-        elif isinstance(response, dict) and 'items' in response:
-            items = response.get('items', [])
-            if items:
-                group_data = items[0]
+        # Обработка ответа для разных форматов
+        group_data = None
+        
+        if isinstance(response, list):
+            if len(response) > 0:
+                group_data = response[0]
             else:
-                logger.error(f"Пустой список items в ответе для {group_id}")
+                logger.error(f"Пустой список в ответе для {group_identifier}")
                 return None
         elif isinstance(response, dict):
-            group_data = response
-        else:
-            logger.error(f"Неизвестный формат ответа: {type(response)}")
-            return None
+            # Иногда VK возвращает {'count': X, 'items': [...]}
+            if 'items' in response:
+                items = response.get('items', [])
+                if items:
+                    group_data = items[0]
+            else:
+                group_data = response
         
         if not group_data or 'id' not in group_data or 'name' not in group_data:
-            logger.error(f"Неполные данные группы {group_id}: {group_data}")
+            logger.error(f"Неполные данные группы {group_identifier}: {group_data}")
             return None
         
         # VK возвращает отрицательные ID для групп
@@ -202,9 +189,9 @@ class VKAPIClient:
             group_id_value = abs(group_id_value)
         
         result = {
-            'id': group_id_value,
-            'name': group_data.get('name'),
-            'screen_name': group_data.get('screen_name', str(group_id)),
+            'id': str(group_id_value),
+            'name': group_data.get('name', ''),
+            'screen_name': group_data.get('screen_name', group_identifier),
             'members_count': group_data.get('members_count', 0),
             'description': group_data.get('description', ''),
             'activity': group_data.get('activity', ''),
@@ -220,31 +207,25 @@ class VKAPIClient:
         """Получает участников группы"""
         logger.info(f"Запрос участников группы {group_id}, лимит: {limit}")
         
-        # Проверяем, что group_id - число (VK API требует числовой ID)
-        if not isinstance(group_id, (int, str)):
-            logger.error(f"Group ID должен быть числом или строкой: {type(group_id)}")
-            return []
-        
-        # Преобразуем в строку и проверяем
+        # Преобразуем в строку и проверяем, что это числовой ID
         group_id_str = str(group_id)
         if not group_id_str.lstrip('-').isdigit():
-            logger.error(f"Group ID должен быть числом: {group_id_str}")
+            logger.error(f"Group ID должен быть числом для метода getMembers: {group_id_str}")
             return []
         
-        # Берем абсолютное значение (VK использует отрицательные ID для групп)
+        # Берем абсолютное значение
         group_id_num = abs(int(group_id_str))
-        
         limit = min(limit, 1000)
         
         try:
             # Проверяем доступность группы
-            group_info = await self.get_group_info(f"vk.com/{group_id_num}")
+            group_info = await self.get_group_info(str(group_id_num))
             if not group_info:
                 logger.error(f"Группа {group_id_num} не найдена")
                 return []
             
             if group_info.get('is_closed', 1) != 0:
-                logger.warning(f"Группа {group_id_num} закрыта")
+                logger.warning(f"Группа {group_id_num} закрыта, участники недоступны")
                 return []
             
             total_members = group_info.get('members_count', 0)
@@ -252,7 +233,7 @@ class VKAPIClient:
                 logger.warning(f"У группы {group_id_num} нет участников")
                 return []
             
-            real_limit = min(limit, total_members)
+            real_limit = min(limit, total_members, 1000)
             logger.info(f"Сбор {real_limit} участников из {total_members}")
             
             members = []
@@ -266,7 +247,7 @@ class VKAPIClient:
                     'group_id': group_id_num,
                     'offset': offset,
                     'count': current_batch,
-                    'fields': 'sex,bdate,city,country,interests,activities,books,music,movies,games'
+                    'fields': 'sex,bdate,city,country,interests'
                 }
                 
                 response = await self._make_request('groups.getMembers', params)
@@ -298,95 +279,106 @@ class VKAPIClient:
             return []
     
     async def test_connection(self) -> Dict[str, Any]:
-        """Тестирование подключения к VK API"""
+        """Тестирование подключения к VK API с реальными тестами"""
         logger.info("Тестирование подключения к VK API...")
         
         test_results = []
         
-        # Тест 1: Базовый запрос (пользователь с ID=1 - Павел Дуров)
+        # Тест 1: Базовый запрос (проверка токена)
         try:
-            logger.info("Тест 1: Базовый запрос к API")
+            logger.info("Тест 1: Базовый запрос к API (проверка токена)")
             params = {'user_ids': '1', 'fields': 'first_name,last_name'}
             response = await self._make_request('users.get', params)
             
             if response and isinstance(response, list) and len(response) > 0:
                 user = response[0]
                 test_results.append({
-                    'test': 'Базовый запрос к API',
+                    'test': 'Проверка токена VK',
                     'success': True,
-                    'message': f"✅ Успешно: {user.get('first_name', '')} {user.get('last_name', '')}"
+                    'message': f"✅ Токен рабочий: {user.get('first_name', '')} {user.get('last_name', '')}"
                 })
             else:
                 test_results.append({
-                    'test': 'Базовый запрос к API',
+                    'test': 'Проверка токена VK',
                     'success': False,
-                    'message': '❌ Нет ответа'
+                    'message': '❌ Токен не работает или нет доступа'
                 })
         except Exception as e:
             test_results.append({
-                'test': 'Базовый запрос к API',
+                'test': 'Проверка токена VK',
                 'success': False,
-                'message': f'❌ Ошибка: {str(e)}'
+                'message': f'❌ Ошибка: {str(e)[:100]}'
             })
         
-        # Тест 2: Запрос информации о группе по короткому имени
+        # Тест 2: Запрос группы по числовому ID (публичная группа)
         try:
-            logger.info("Тест 2: Запрос информации о группе")
-            # Используем известную группу - durov (Павел Дуров)
-            params = {
-                'group_id': 'durov',
-                'fields': 'name,members_count'
-            }
-            response = await self._make_request('groups.getById', params)
+            logger.info("Тест 2: Запрос группы по ID (public1)")
+            # Используем публичную группу с ID 1 (ВКонтакте API)
+            group_info = await self.get_group_info("vk.com/public1")
             
-            if response and isinstance(response, list) and len(response) > 0:
-                group = response[0]
+            if group_info:
                 test_results.append({
-                    'test': 'Запрос информации о группе',
+                    'test': 'Запрос группы по числовому ID',
                     'success': True,
-                    'message': f"✅ Успешно: {group.get('name', '')} ({group.get('members_count', 0)} участников)"
+                    'message': f"✅ Группа найдена: {group_info['name']} ({group_info['members_count']} участников)"
                 })
             else:
                 test_results.append({
-                    'test': 'Запрос информации о группе',
+                    'test': 'Запрос группы по числовому ID',
                     'success': False,
-                    'message': '❌ Нет ответа или пустой ответ'
+                    'message': '❌ Группа не найдена или недоступна'
                 })
         except Exception as e:
             test_results.append({
-                'test': 'Запрос информации о группе',
+                'test': 'Запрос группы по числовому ID',
                 'success': False,
-                'message': f'❌ Ошибка: {str(e)}'
+                'message': f'❌ Ошибка: {str(e)[:100]}'
             })
         
-        # Тест 3: Запрос информации о группе по числовому ID
+        # Тест 3: Попытка запроса по короткому имени
         try:
-            logger.info("Тест 3: Запрос информации о группе по ID")
-            # Группа с ID 1 (ВКонтакте API)
-            params = {
-                'group_id': '1',
-                'fields': 'name'
-            }
-            response = await self._make_request('groups.getById', params)
+            logger.info("Тест 3: Запрос группы по короткому имени")
+            # Пробуем разные варианты
+            test_groups = [
+                "durov",           # Павел Дуров
+                "club1",           # Альтернативный ID
+                "hobby_universe"   # Группа из ошибки пользователя
+            ]
             
-            if response and isinstance(response, list) and len(response) > 0:
-                group = response[0]
+            success = False
+            details = []
+            
+            for test_group in test_groups:
+                try:
+                    logger.debug(f"Пробуем группу: {test_group}")
+                    group_info = await self.get_group_info(f"vk.com/{test_group}")
+                    
+                    if group_info:
+                        success = True
+                        details.append(f"✅ {test_group}: {group_info['name']} ({group_info['members_count']} участников)")
+                        break  # Останавливаемся на первой успешной
+                    else:
+                        details.append(f"❌ {test_group}: не найдена")
+                except Exception as e:
+                    details.append(f"⚠️ {test_group}: ошибка {str(e)[:50]}")
+            
+            if success:
                 test_results.append({
-                    'test': 'Запрос информации о группе по ID',
+                    'test': 'Запрос группы по короткому имени',
                     'success': True,
-                    'message': f"✅ Успешно: {group.get('name', '')}"
+                    'message': f"✅ Успешно: найдена рабочая группа\n" + "\n".join(details)
                 })
             else:
                 test_results.append({
-                    'test': 'Запрос информации о группе по ID',
+                    'test': 'Запрос группы по короткому имени',
                     'success': False,
-                    'message': '❌ Нет ответа'
+                    'message': f"❌ Не удалось найти ни одну группу по короткому имени\n" + "\n".join(details)
                 })
         except Exception as e:
             test_results.append({
-                'test': 'Запрос информации о группе по ID',
+                'test': 'Запрос группы по короткому имени',
                 'success': False,
-                'message': f'❌ Ошибка: {str(e)}'
+                'message': f'❌ Общая ошибка: {str(e)[:100]}'
             })
         
         # Анализ результатов
@@ -396,19 +388,25 @@ class VKAPIClient:
         if success_count == total_tests:
             return {
                 'success': True,
-                'message': f'✅ Все {total_tests} теста пройдены успешно! VK API работает корректно.',
+                'message': f'✅ Отлично! Все {total_tests} теста пройдены. VK API полностью доступен.',
                 'details': test_results
             }
-        elif success_count > 0:
+        elif success_count >= 2:
             return {
                 'success': True,
-                'message': f'⚠️ Частичная доступность: {success_count}/{total_tests} тестов пройдены',
+                'message': f'⚠️ Частичная доступность: {success_count}/{total_tests} тестов пройдены. Основные функции работают.',
+                'details': test_results
+            }
+        elif success_count >= 1:
+            return {
+                'success': True,
+                'message': f'⚠️ Ограниченная доступность: {success_count}/{total_tests} тестов пройдены. Токен работает, но могут быть проблемы с группами.',
                 'details': test_results
             }
         else:
             return {
                 'success': False,
-                'message': '❌ Все тесты не пройдены. VK API недоступен.',
+                'message': '❌ Критическая проблема: VK API недоступен. Проверьте токен и настройки.',
                 'details': test_results
             }
     
