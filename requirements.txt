@@ -3,7 +3,7 @@ aiohttp==3.9.3
 python-dotenv==1.0.1
 psycopg2-binary==2.9.9
 redis==5.0.1
-vkbottle==4.6.2
+vkbottle==4.5.0.
 pandas==2.2.0
 numpy==1.26.4
 scikit-learn==1.4.1.post1
