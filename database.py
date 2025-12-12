@@ -6,7 +6,7 @@ import asyncpg
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy import Column, Integer, String, JSON, DateTime, Text
-import os
+import sqlalchemy
 
 from config import config
 
@@ -36,15 +36,12 @@ class Database:
         self.async_session = None
         
     async def init_db(self):
-        """Инициализация базы данных"""
         if config.DATABASE_URL.startswith('postgresql'):
-            # PostgreSQL для Railway
             self.engine = create_async_engine(
                 config.DATABASE_URL.replace('postgresql://', 'postgresql+asyncpg://'),
                 echo=False
             )
         else:
-            # SQLite для разработки
             self.engine = create_async_engine(
                 'sqlite+aiosqlite:///database.db',
                 echo=False
@@ -58,9 +55,7 @@ class Database:
             await conn.run_sync(Base.metadata.create_all)
     
     async def save_analysis(self, user_id: int, group_id: str, group_name: str, analysis: Dict):
-        """Сохраняет результат анализа"""
         async with self.async_session() as session:
-            # Сохраняем анализ
             analysis_record = AnalysisResult(
                 user_id=user_id,
                 group_id=group_id,
@@ -69,7 +64,6 @@ class Database:
             )
             session.add(analysis_record)
             
-            # Обновляем статистику пользователя
             stats = await session.get(UserStats, user_id)
             if not stats:
                 stats = UserStats(user_id=user_id)
@@ -81,14 +75,11 @@ class Database:
             await session.commit()
     
     async def get_user_stats(self, user_id: int) -> Dict:
-        """Получает статистику пользователя"""
         async with self.async_session() as session:
-            # Статистика
             stats = await session.get(UserStats, user_id)
             if not stats:
                 return {'total_analyses': 0, 'saved_reports': 0}
             
-            # Последние анализы
             result = await session.execute(
                 sqlalchemy.select(AnalysisResult)
                 .where(AnalysisResult.user_id == user_id)
@@ -109,7 +100,6 @@ class Database:
             }
     
     async def get_analysis_history(self, user_id: int, limit: int = 10) -> List[Dict]:
-        """Получает историю анализов пользователя"""
         async with self.async_session() as session:
             result = await session.execute(
                 sqlalchemy.select(AnalysisResult)
