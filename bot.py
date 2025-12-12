@@ -5,8 +5,10 @@ from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.enums import ParseMode
 import os
+import sys
 
-from config import TELEGRAM_BOT_TOKEN, ADMIN_IDS
+# Правильный импорт config
+from config import config
 from vk_api_client import VKAPIClient
 from analytics import AudienceAnalyzer
 from database import Database
@@ -14,12 +16,14 @@ from database import Database
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=TELEGRAM_BOT_TOKEN, parse_mode=ParseMode.HTML)
+# Создаем экземпляры
+bot = Bot(token=config.TELEGRAM_BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 db = Database()
 vk_client = VKAPIClient()
 analyzer = AudienceAnalyzer()
 
+# Команда /start
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
@@ -31,6 +35,7 @@ async def cmd_start(message: Message):
         "/help - справка по использованию"
     )
 
+# Команда /analyze
 @dp.message(Command("analyze"))
 async def cmd_analyze(message: Message):
     try:
@@ -95,6 +100,7 @@ async def cmd_analyze(message: Message):
         logger.error(f"Analysis error: {e}")
         await message.answer("❌ Произошла ошибка при анализе")
 
+# Команда /compare
 @dp.message(Command("compare"))
 async def cmd_compare(message: Message):
     try:
@@ -142,21 +148,27 @@ async def cmd_compare(message: Message):
         logger.error(f"Compare error: {e}")
         await message.answer("❌ Ошибка при сравнении")
 
+# Команда /stats
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
-    stats = await db.get_user_stats(message.from_user.id)
-    
-    report = f"📈 <b>Ваша статистика</b>\n\n"
-    report += f"🔍 Проанализировано групп: {stats.get('total_analyses', 0)}\n"
-    report += f"💾 Сохранено отчетов: {stats.get('saved_reports', 0)}\n"
-    
-    if stats.get('last_analyses'):
-        report += "\n<b>Последние анализы:</b>\n"
-        for analysis in stats['last_analyses'][:3]:
-            report += f"• {analysis['group_name']} - {analysis['created_at'].strftime('%d.%m.%Y')}\n"
-    
-    await message.answer(report)
+    try:
+        stats = await db.get_user_stats(message.from_user.id)
+        
+        report = f"📈 <b>Ваша статистика</b>\n\n"
+        report += f"🔍 Проанализировано групп: {stats.get('total_analyses', 0)}\n"
+        report += f"💾 Сохранено отчетов: {stats.get('saved_reports', 0)}\n"
+        
+        if stats.get('last_analyses'):
+            report += "\n<b>Последние анализы:</b>\n"
+            for analysis in stats['last_analyses'][:3]:
+                report += f"• {analysis['group_name']} - {analysis['created_at'].strftime('%d.%m.%Y')}\n"
+        
+        await message.answer(report)
+    except Exception as e:
+        logger.error(f"Stats error: {e}")
+        await message.answer("❌ Ошибка при получении статистики")
 
+# Команда /help
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     help_text = """
@@ -182,9 +194,16 @@ async def cmd_help(message: Message):
 """
     await message.answer(help_text)
 
+# Основная функция
 async def main():
-    await db.init_db()
-    await dp.start_polling(bot)
+    try:
+        await db.init_db()
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.error(f"Bot error: {e}")
+    finally:
+        # Закрываем сессию VK клиента при завершении
+        await vk_client.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
