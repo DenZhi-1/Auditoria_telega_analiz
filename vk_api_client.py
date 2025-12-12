@@ -13,27 +13,15 @@ class VKAPIClient:
     def __init__(self):
         self.base_url = "https://api.vk.com/method/"
         self.session = None
+        self.request_delay = config.REQUEST_DELAY
         
     async def _get_session(self):
         if not self.session:
             self.session = aiohttp.ClientSession()
         return self.session
     
-    def extract_group_id(self, group_link: str) -> Optional[str]:
-        """Извлекает ID группы из ссылки"""
-        patterns = [
-            r'vk\.com/(club|public)(\d+)',
-            r'vk\.com/([a-zA-Z0-9_]+)'
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, group_link)
-            if match:
-                return match.group(2) if 'club' in pattern or 'public' in pattern else match.group(1)
-        return None
-    
-    async def make_request(self, method: str, params: Dict) -> Optional[Dict]:
-        """Выполняет запрос к VK API"""
+    async def _make_request(self, method: str, params: Dict) -> Optional[Dict]:
+        """Универсальный метод для запросов к VK API"""
         try:
             session = await self._get_session()
             params.update({
@@ -42,28 +30,49 @@ class VKAPIClient:
             })
             
             async with session.get(f"{self.base_url}{method}", params=params) as response:
-                data = await response.json()
-                if 'error' in data:
-                    logger.error(f"VK API error: {data['error']}")
+                if response.status == 200:
+                    data = await response.json()
+                    if 'error' in data:
+                        logger.error(f"VK API error: {data['error']}")
+                        return None
+                    return data.get('response')
+                else:
+                    logger.error(f"HTTP error: {response.status}")
                     return None
-                return data.get('response')
+                    
         except Exception as e:
             logger.error(f"Request error: {e}")
             return None
+        finally:
+            # Соблюдаем ограничение VK API (3 запроса в секунду)
+            await asyncio.sleep(self.request_delay)
+    
+    def _extract_group_id(self, group_link: str) -> Optional[str]:
+        """Извлекает ID или короткое имя группы из ссылки"""
+        patterns = [
+            r'vk\.com/(?:club|public)(\d+)',
+            r'vk\.com/([a-zA-Z0-9_]+)'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, group_link)
+            if match:
+                return match.group(1)
+        return None
     
     async def get_group_info(self, group_link: str) -> Optional[Dict]:
-        """Получает информацию о группе"""
-        group_id = self.extract_group_id(group_link)
+        """Получает основную информацию о группе"""
+        group_id = self._extract_group_id(group_link)
         if not group_id:
             return None
             
         params = {
             'group_id': group_id,
-            'fields': 'members_count,description,activity'
+            'fields': 'members_count,description,activity,status'
         }
         
-        response = await self.make_request('groups.getById', params)
-        if response and len(response) > 0:
+        response = await self._make_request('groups.getById', params)
+        if response and isinstance(response, list) and len(response) > 0:
             group = response[0]
             return {
                 'id': group.get('id'),
@@ -89,7 +98,7 @@ class VKAPIClient:
                 'fields': 'sex,bdate,city,country,interests,activities,books,music,movies,games'
             }
             
-            response = await self.make_request('groups.getMembers', params)
+            response = await self._make_request('groups.getMembers', params)
             if not response:
                 break
                 
@@ -102,15 +111,13 @@ class VKAPIClient:
             
             if len(users) < count or len(members) >= limit:
                 break
-                
-            await asyncio.sleep(config.REQUEST_DELAY)
         
         return members
     
     async def close(self):
-        """Закрывает сессию"""
+        """Корректно закрывает сессию"""
         if self.session:
             await self.session.close()
 
-# Синглтон экземпляр
+# Глобальный экземпляр для использования в боте
 vk_client = VKAPIClient()
