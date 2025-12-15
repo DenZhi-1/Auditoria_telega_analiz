@@ -3,6 +3,7 @@ import logging
 import aiohttp
 from urllib.parse import urlparse
 from typing import Dict, List, Optional, Any
+import re
 
 from config import config
 
@@ -76,7 +77,6 @@ class VKAPIClient:
                     # Если это числовой ID в формате public123 или club123
                     if identifier.startswith(('public', 'club', 'event')):
                         # Извлекаем цифры
-                        import re
                         numbers = re.findall(r'\d+', identifier)
                         if numbers:
                             return numbers[0]
@@ -96,7 +96,8 @@ class VKAPIClient:
             await asyncio.sleep(self.request_delay)
             
             # Добавляем обязательные параметры
-            params.update({
+            all_params = params.copy()
+            all_params.update({
                 'v': self.api_version,
                 'access_token': self.access_token
             })
@@ -104,37 +105,48 @@ class VKAPIClient:
             if not self.session or self.session.closed:
                 await self.init_session()
             
-            logger.debug(f"VK API запрос: {method} с параметрами {params}")
+            logger.debug(f"VK API запрос: {method} с параметрами {all_params}")
+            
+            url = f"{self.base_url}{method}"
             
             async with self.session.post(
-                f"{self.base_url}{method}",
-                params=params,
+                url,
+                params=all_params,
                 timeout=self.request_timeout
             ) as response:
                 response_text = await response.text()
-                data = await response.json()
                 
                 if response.status != 200:
-                    logger.error(f"HTTP ошибка {response.status}: {response_text}")
+                    logger.error(f"HTTP ошибка {response.status} для {method}: {response_text[:200]}")
+                    return None
+                
+                try:
+                    data = await response.json()
+                except Exception as json_error:
+                    logger.error(f"Ошибка парсинга JSON для {method}: {json_error}, текст ответа: {response_text[:200]}")
                     return None
                 
                 if 'error' in data:
                     error = data['error']
+                    error_code = error.get('error_code', 'unknown')
                     error_msg = error.get('error_msg', 'Неизвестная ошибка')
-                    logger.error(f"VK API ошибка: {error_msg}")
+                    logger.error(f"VK API ошибка {error_code} для {method}: {error_msg}")
                     
                     # Не прерываем выполнение для некоторых ошибок
-                    if error.get('error_code') == 15:  # Доступ запрещен
+                    if error_code == 15:  # Доступ запрещен
                         return {'error': 'group_closed', 'message': 'Группа закрыта'}
-                    elif error.get('error_code') == 18:  # Страница удалена
+                    elif error_code == 18:  # Страница удалена
                         return {'error': 'group_deleted', 'message': 'Группа удалена'}
-                    elif error.get('error_code') == 100:  # Неверный параметр
+                    elif error_code == 100:  # Неверный параметр
                         return {'error': 'invalid_param', 'message': 'Неверный ID группы'}
+                    elif error_code == 113:  # Неверный идентификатор пользователя
+                        return {'error': 'invalid_id', 'message': 'Неверный ID группы'}
                     
                     return None
                 
-                logger.debug(f"VK API успешный ответ: {method}")
-                return data.get('response')
+                response_data = data.get('response')
+                logger.debug(f"VK API успешный ответ для {method}: {str(response_data)[:200]}")
+                return response_data
                 
         except asyncio.TimeoutError:
             logger.error(f"Таймаут запроса к VK API: {method}")
@@ -143,66 +155,137 @@ class VKAPIClient:
             logger.error(f"Ошибка сети при запросе к VK API: {e}")
             return None
         except Exception as e:
-            logger.error(f"Неожиданная ошибка при запросе к VK API: {e}")
+            logger.error(f"Неожиданная ошибка при запросе к VK API: {e}", exc_info=True)
             return None
     
-    async def get_group_info(self, group_link: str) -> Optional[Dict]:
-        """
-        Получает информацию о группе ВК
+    def _extract_group_info_from_response(self, response) -> Optional[Dict]:
+        """Извлекает информацию о группе из ответа VK API"""
+        if not response:
+            return None
         
-        Returns:
-            Dict с информацией о группе или None в случае ошибки
+        group_info = None
+        
+        # Вариант 1: Прямой список
+        if isinstance(response, list) and len(response) > 0:
+            group_info = response[0]
+        # Вариант 2: Словарь с 'groups'
+        elif isinstance(response, dict):
+            if 'groups' in response and isinstance(response['groups'], list) and len(response['groups']) > 0:
+                group_info = response['groups'][0]
+            elif 'response' in response:
+                # Рекурсивно пробуем извлечь из вложенного response
+                return self._extract_group_info_from_response(response['response'])
+        
+        if not group_info or not isinstance(group_info, dict):
+            return None
+        
+        # Проверяем обязательные поля
+        if 'id' not in group_info or 'name' not in group_info:
+            return None
+        
+        # Нормализуем поля
+        group_info['is_closed'] = group_info.get('is_closed', 1)
+        group_info['members_count'] = group_info.get('members_count', 0)
+        group_info['screen_name'] = group_info.get('screen_name', f"club{group_info['id']}")
+        
+        return group_info
+    
+    async def get_group_info_universal(self, group_link: str) -> Optional[Dict]:
+        """
+        Универсальный метод получения информации о группе ВК
+        Обрабатывает все возможные форматы ответа от VK API
         """
         try:
             group_id = self.extract_group_id(group_link)
             if not group_id:
-                logger.error(f"Не удалось извлечь ID группы из ссылки: {group_link}")
                 return None
             
-            logger.info(f"Запрос информации о группе: {group_link} (ID: {group_id})")
+            logger.info(f"Универсальный запрос информации о группе: {group_link}")
             
-            # Определяем тип идентификатора
-            params = {}
-            if group_id.isdigit():
-                params['group_id'] = group_id
-            else:
-                params['group_ids'] = group_id
+            # Пробуем несколько подходов
+            approaches = [
+                self._get_group_info_v1,  # Первый подход
+                self._get_group_info_v2,  # Второй подход
+                self._get_group_info_v3   # Третий подход
+            ]
             
-            params['fields'] = 'description,members_count,activity,status'
+            for approach in approaches:
+                try:
+                    result = await approach(group_id)
+                    if result:
+                        logger.info(f"Успешно получена информация о группе {group_id} с помощью {approach.__name__}")
+                        return result
+                except Exception as e:
+                    logger.debug(f"Подход {approach.__name__} не сработал: {e}")
+                    continue
             
-            response = await self.make_request('groups.getById', params)
-            if not response:
-                return None
-            
-            # Обработка ответа
-            if isinstance(response, list) and len(response) > 0:
-                group_info = response[0]
-                
-                # Проверяем обязательные поля
-                required_fields = ['id', 'name']
-                for field in required_fields:
-                    if field not in group_info:
-                        logger.error(f"В информации о группе отсутствует поле {field}: {group_info}")
-                        return None
-                
-                # Добавляем числовой ID если был передан screen_name
-                if isinstance(group_info['id'], str) and group_info['id'].isdigit():
-                    group_info['id'] = int(group_info['id'])
-                
-                # Нормализуем поля
-                group_info['is_closed'] = group_info.get('is_closed', 1)
-                group_info['members_count'] = group_info.get('members_count', 0)
-                group_info['screen_name'] = group_info.get('screen_name', f"club{group_info['id']}")
-                
-                logger.info(f"Получена информация о группе {group_info['name']} (ID: {group_info['id']})")
-                return group_info
-            
-            logger.error(f"Неверный формат ответа для группы {group_id}: {response}")
+            logger.error(f"Все подходы не сработали для группы {group_id}")
             return None
             
         except Exception as e:
-            logger.error(f"Ошибка при получении информации о группе {group_link}: {e}")
+            logger.error(f"Ошибка в универсальном методе: {e}")
             return None
+    
+    async def _get_group_info_v1(self, group_id: str) -> Optional[Dict]:
+        """Подход 1: Используем стандартный метод groups.getById"""
+        params = {
+            'group_id': group_id,
+            'fields': 'description,members_count,activity,status,is_closed,type'
+        }
+        
+        response = await self.make_request('groups.getById', params)
+        return self._extract_group_info_from_response(response)
+    
+    async def _get_group_info_v2(self, group_id: str) -> Optional[Dict]:
+        """Подход 2: Используем groups.getById с явным указанием group_ids"""
+        params = {
+            'group_ids': group_id,
+            'fields': 'description,members_count,activity,status,is_closed,type'
+        }
+        
+        response = await self.make_request('groups.getById', params)
+        return self._extract_group_info_from_response(response)
+    
+    async def _get_group_info_v3(self, group_id: str) -> Optional[Dict]:
+        """Подход 3: Пробуем получить через groups.getById без полей сначала"""
+        params = {'group_id': group_id}
+        
+        response = await self.make_request('groups.getById', params)
+        if not response:
+            return None
+        
+        # Если получили базовую информацию, запрашиваем доп. поля
+        group_info = self._extract_group_info_from_response(response)
+        if group_info and 'id' in group_info:
+            # Запрашиваем дополнительные поля отдельно
+            params_with_fields = {
+                'group_id': group_info['id'],
+                'fields': 'description,members_count,activity,status,is_closed,type'
+            }
+            detailed_response = await self.make_request('groups.getById', params_with_fields)
+            detailed_info = self._extract_group_info_from_response(detailed_response)
+            if detailed_info:
+                return detailed_info
+        
+        return group_info
+    
+    async def get_group_info(self, group_link: str) -> Optional[Dict]:
+        """Получает информацию о группе ВК (основной метод)"""
+        # Используем универсальный метод
+        group_info = await self.get_group_info_universal(group_link)
+        
+        if not group_info:
+            return None
+        
+        # Дополнительные проверки
+        if group_info.get('deactivated'):
+            logger.warning(f"Группа {group_info.get('id')} деактивирована: {group_info.get('deactivated')}")
+            return None
+        
+        logger.info(f"Успешно получена информация о группе: {group_info.get('name')} "
+                    f"(ID: {group_info.get('id')}, участников: {group_info.get('members_count', 0)})")
+        
+        return group_info
     
     async def get_group_members(self, group_id: int, limit: int = 1000) -> List[Dict]:
         """
