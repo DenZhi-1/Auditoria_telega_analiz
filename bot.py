@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import json
+import time
 from datetime import datetime
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -126,6 +127,21 @@ def create_text_analysis_keyboard() -> InlineKeyboardMarkup:
         ]
     )
     return keyboard
+
+async def cleanup_old_sessions():
+    """Очищает старые сессии пользователей"""
+    current_time = time.time()
+    timeout = 3600  # 1 час
+    
+    to_remove = []
+    for user_id, session in user_sessions.items():
+        session_time = session.get('created_at', 0)
+        if current_time - session_time > timeout:
+            to_remove.append(user_id)
+    
+    for user_id in to_remove:
+        del user_sessions[user_id]
+        logger.debug(f"Очищена устаревшая сессия пользователя {user_id}")
 
 # ==================== ОСНОВНЫЕ КОМАНДЫ БОТА ====================
 
@@ -277,6 +293,9 @@ async def cmd_analyze(message: Message, command: CommandObject = None):
         group_link = args[0].strip()
         user_id = message.from_user.id
         
+        # Очищаем старые сессии
+        await cleanup_old_sessions()
+        
         # Проверяем, не выполняется ли уже анализ для этого пользователя
         if user_id in user_sessions and user_sessions[user_id].get('status') == 'analyzing':
             await message.answer(
@@ -289,7 +308,8 @@ async def cmd_analyze(message: Message, command: CommandObject = None):
         user_sessions[user_id] = {
             'status': 'analyzing',
             'group_link': group_link,
-            'current_step': 'получение_информации'
+            'current_step': 'получение_информации',
+            'created_at': time.time()
         }
         
         await message.answer("⏳ <b>Начинаю полный анализ аудитории...</b>")
@@ -392,9 +412,10 @@ async def cmd_analyze(message: Message, command: CommandObject = None):
         )
         
         # Сохраняем результаты в базу данных
+        # ФИКС: Преобразуем group_id в строку для PostgreSQL
         saved = await db.save_analysis(
             user_id=user_id,
-            group_id=group_info['id'],
+            group_id=str(group_info['id']),  # Преобразуем в строку
             group_name=group_info['name'],
             analysis=analysis
         )
@@ -512,7 +533,8 @@ async def send_comprehensive_report(message: Message, group_info: dict, analysis
         user_sessions[user_id]['report_data'] = {
             'group_info': group_info,
             'analysis': analysis,
-            'analyzed_count': analyzed_count
+            'analyzed_count': analyzed_count,
+            'created_at': time.time()
         }
 
 @dp.callback_query(F.data.startswith("report_"))
@@ -520,30 +542,45 @@ async def handle_report_callback(callback: CallbackQuery):
     """Обработка callback для детальных разделов отчета"""
     user_id = callback.from_user.id
     
-    if user_id not in user_sessions or 'report_data' not in user_sessions[user_id]:
-        await callback.answer("Данные отчета устарели. Пожалуйста, выполните анализ заново.")
-        return
-    
-    report_data = user_sessions[user_id]['report_data']
-    group_info = report_data['group_info']
-    analysis = report_data['analysis']
-    
-    report_type = callback.data.replace("report_", "")
-    
-    if report_type == "demography":
-        await send_demography_report(callback.message, analysis)
-    elif report_type == "interests":
-        await send_interests_report(callback.message, analysis)
-    elif report_type == "activity":
-        await send_activity_report(callback.message, analysis)
-    elif report_type == "geography":
-        await send_geography_report(callback.message, analysis)
-    elif report_type == "quality":
-        await send_quality_report(callback.message, analysis)
-    elif report_type == "recommendations":
-        await send_recommendations_report(callback.message, analysis)
-    
-    await callback.answer()
+    try:
+        # Очищаем старые сессии
+        await cleanup_old_sessions()
+        
+        if user_id not in user_sessions or 'report_data' not in user_sessions[user_id]:
+            await callback.answer("Данные отчета устарели. Пожалуйста, выполните анализ заново.", show_alert=True)
+            return
+        
+        report_data = user_sessions[user_id]['report_data']
+        
+        # Проверяем, не устарели ли данные (более 1 часа)
+        if time.time() - report_data.get('created_at', 0) > 3600:
+            del user_sessions[user_id]
+            await callback.answer("Данные отчета устарели. Пожалуйста, выполните анализ заново.", show_alert=True)
+            return
+        
+        group_info = report_data['group_info']
+        analysis = report_data['analysis']
+        
+        report_type = callback.data.replace("report_", "")
+        
+        if report_type == "demography":
+            await send_demography_report(callback.message, analysis)
+        elif report_type == "interests":
+            await send_interests_report(callback.message, analysis)
+        elif report_type == "activity":
+            await send_activity_report(callback.message, analysis)
+        elif report_type == "geography":
+            await send_geography_report(callback.message, analysis)
+        elif report_type == "quality":
+            await send_quality_report(callback.message, analysis)
+        elif report_type == "recommendations":
+            await send_recommendations_report(callback.message, analysis)
+        
+        await callback.answer()
+        
+    except Exception as e:
+        logger.error(f"Ошибка в колбэке {callback.data}: {e}")
+        await callback.answer("Произошла ошибка. Попробуйте еще раз.", show_alert=True)
 
 async def send_demography_report(message: Message, analysis: dict):
     """Отправляет отчет по демографии"""
@@ -975,17 +1012,22 @@ async def back_to_report(callback: CallbackQuery):
     """Возвращает к основному отчету"""
     user_id = callback.from_user.id
     
-    if user_id not in user_sessions or 'report_data' not in user_sessions[user_id]:
-        await callback.answer("Данные отчета устарели")
-        return
-    
-    report_data = user_sessions[user_id]['report_data']
-    group_info = report_data['group_info']
-    analysis = report_data['analysis']
-    analyzed_count = report_data['analyzed_count']
-    
-    await send_comprehensive_report(callback.message, group_info, analysis, analyzed_count)
-    await callback.answer()
+    try:
+        if user_id not in user_sessions or 'report_data' not in user_sessions[user_id]:
+            await callback.answer("Данные отчета устарели", show_alert=True)
+            return
+        
+        report_data = user_sessions[user_id]['report_data']
+        group_info = report_data['group_info']
+        analysis = report_data['analysis']
+        analyzed_count = report_data['analyzed_count']
+        
+        await send_comprehensive_report(callback.message, group_info, analysis, analyzed_count)
+        await callback.answer()
+        
+    except Exception as e:
+        logger.error(f"Ошибка в back_to_report: {e}")
+        await callback.answer("Произошла ошибка", show_alert=True)
 
 @dp.message(Command("competitors"))
 async def cmd_competitors(message: Message, command: CommandObject = None):
@@ -1006,6 +1048,9 @@ async def cmd_competitors(message: Message, command: CommandObject = None):
         group_link = args[0].strip()
         user_id = message.from_user.id
         
+        # Очищаем старые сессии
+        await cleanup_old_sessions()
+        
         # Проверяем, не выполняется ли уже анализ для этого пользователя
         if user_id in user_sessions and user_sessions[user_id].get('status') == 'analyzing_competitors':
             await message.answer(
@@ -1018,7 +1063,8 @@ async def cmd_competitors(message: Message, command: CommandObject = None):
         user_sessions[user_id] = {
             'status': 'analyzing_competitors',
             'group_link': group_link,
-            'current_step': 'получение_информации'
+            'current_step': 'получение_информации',
+            'created_at': time.time()
         }
         
         await message.answer("🥊 <b>Начинаю анализ конкурентов...</b>")
@@ -1153,7 +1199,8 @@ async def cmd_competitors(message: Message, command: CommandObject = None):
         user_sessions[user_id]['report_data'] = {
             'group_info': group_info,
             'target_analysis': target_analysis,
-            'competitors': analyzed_competitors
+            'competitors': analyzed_competitors,
+            'created_at': time.time()
         }
         
     except Exception as e:
@@ -1189,7 +1236,7 @@ async def send_competitor_report(message: Message, target_group: dict,
     
     await message.answer(report, reply_markup=create_competitor_keyboard())
     
-    # Детальная информация о конкурентах
+    # Детальная информация о конкурентам
     details = "<b>📊 ПОДРОБНЫЙ АНАЛИЗ КОНКУРЕНТОВ:</b>\n\n"
     
     for i, competitor in enumerate(competitors[:5], 1):
@@ -1254,60 +1301,88 @@ async def top_competitors_callback(callback: CallbackQuery):
     """Показывает ТОП-5 конкурентов"""
     user_id = callback.from_user.id
     
-    if user_id not in user_sessions or 'report_data' not in user_sessions[user_id]:
-        await callback.answer("Данные устарели. Выполните анализ заново.")
-        return
-    
-    report_data = user_sessions[user_id]['report_data']
-    competitors = report_data.get('competitors', [])
-    
-    if not competitors:
-        await callback.answer("Нет данных о конкурентах")
-        return
-    
-    # Сортируем по качеству аудитории
-    sorted_competitors = sorted(
-        competitors,
-        key=lambda x: x.get('analysis', {}).get('audience_quality_score', 0),
-        reverse=True
-    )
-    
-    report = "<b>🏆 ТОП-5 КОНКУРЕНТОВ ПО КАЧЕСТВУ АУДИТОРИИ</b>\n\n"
-    
-    for i, competitor in enumerate(sorted_competitors[:5], 1):
-        score = competitor.get('analysis', {}).get('audience_quality_score', 0)
-        stars = "⭐" * min(5, int(score / 20))
+    try:
+        await cleanup_old_sessions()
         
-        report += f"<b>{i}. {competitor.get('name', 'Без названия')}</b>\n"
-        report += f"• Качество: {score}/100 {stars}\n"
-        report += f"• Участников: {format_number(competitor.get('members_count', 0))}\n"
+        if user_id not in user_sessions or 'report_data' not in user_sessions[user_id]:
+            await callback.answer("Данные устарели. Выполните анализ заново.", show_alert=True)
+            return
         
-        gender = competitor.get('analysis', {}).get('gender', {})
-        if gender:
-            main_gender = "👨 М" if gender.get('male', 0) > gender.get('female', 0) else "👩 Ж"
-            report += f"• Преобладающий пол: {main_gender}\n"
+        report_data = user_sessions[user_id]['report_data']
         
-        report += f"• Ссылка: vk.com/{competitor.get('screen_name', '')}\n\n"
-    
-    await callback.message.answer(report, reply_markup=create_back_button("back_to_competitors"))
-    await callback.answer()
+        # Проверяем, не устарели ли данные
+        if time.time() - report_data.get('created_at', 0) > 3600:
+            del user_sessions[user_id]
+            await callback.answer("Данные устарели. Выполните анализ заново.", show_alert=True)
+            return
+        
+        competitors = report_data.get('competitors', [])
+        
+        if not competitors:
+            await callback.answer("Нет данных о конкурентах", show_alert=True)
+            return
+        
+        # Сортируем по качеству аудитории
+        sorted_competitors = sorted(
+            competitors,
+            key=lambda x: x.get('analysis', {}).get('audience_quality_score', 0),
+            reverse=True
+        )
+        
+        report = "<b>🏆 ТОП-5 КОНКУРЕНТОВ ПО КАЧЕСТВУ АУДИТОРИИ</b>\n\n"
+        
+        for i, competitor in enumerate(sorted_competitors[:5], 1):
+            score = competitor.get('analysis', {}).get('audience_quality_score', 0)
+            stars = "⭐" * min(5, int(score / 20))
+            
+            report += f"<b>{i}. {competitor.get('name', 'Без названия')}</b>\n"
+            report += f"• Качество: {score}/100 {stars}\n"
+            report += f"• Участников: {format_number(competitor.get('members_count', 0))}\n"
+            
+            gender = competitor.get('analysis', {}).get('gender', {})
+            if gender:
+                main_gender = "👨 М" if gender.get('male', 0) > gender.get('female', 0) else "👩 Ж"
+                report += f"• Преобладающий пол: {main_gender}\n"
+            
+            report += f"• Ссылка: vk.com/{competitor.get('screen_name', '')}\n\n"
+        
+        await callback.message.answer(report, reply_markup=create_back_button("back_to_competitors"))
+        await callback.answer()
+        
+    except Exception as e:
+        logger.error(f"Ошибка в top_competitors_callback: {e}")
+        await callback.answer("Произошла ошибка", show_alert=True)
 
 @dp.callback_query(F.data == "back_to_competitors")
 async def back_to_competitors(callback: CallbackQuery):
     """Возвращает к отчету по конкурентам"""
     user_id = callback.from_user.id
     
-    if user_id not in user_sessions or 'report_data' not in user_sessions[user_id]:
-        await callback.answer("Данные устарели")
-        return
-    
-    report_data = user_sessions[user_id]['report_data']
-    group_info = report_data['group_info']
-    target_analysis = report_data['target_analysis']
-    competitors = report_data['competitors']
-    
-    await send_competitor_report(callback.message, group_info, target_analysis, competitors)
-    await callback.answer()
+    try:
+        await cleanup_old_sessions()
+        
+        if user_id not in user_sessions or 'report_data' not in user_sessions[user_id]:
+            await callback.answer("Данные устарели", show_alert=True)
+            return
+        
+        report_data = user_sessions[user_id]['report_data']
+        
+        # Проверяем, не устарели ли данные
+        if time.time() - report_data.get('created_at', 0) > 3600:
+            del user_sessions[user_id]
+            await callback.answer("Данные устарели", show_alert=True)
+            return
+        
+        group_info = report_data['group_info']
+        target_analysis = report_data['target_analysis']
+        competitors = report_data['competitors']
+        
+        await send_competitor_report(callback.message, group_info, target_analysis, competitors)
+        await callback.answer()
+        
+    except Exception as e:
+        logger.error(f"Ошибка в back_to_competitors: {e}")
+        await callback.answer("Произошла ошибка", show_alert=True)
 
 @dp.message(Command("text_analysis"))
 async def cmd_text_analysis(message: Message, command: CommandObject = None):
@@ -1364,7 +1439,8 @@ async def cmd_text_analysis(message: Message, command: CommandObject = None):
             'text_analysis_data': {
                 'group_info': group_info,
                 'analysis': analysis,
-                'text_content': text_content[:1000]  # Сохраняем первые 1000 символов
+                'text_content': text_content[:1000],  # Сохраняем первые 1000 символов
+                'created_at': time.time()
             }
         }
         
@@ -1491,86 +1567,114 @@ async def text_sentiment_callback(callback: CallbackQuery):
     """Показывает детальный анализ тональности"""
     user_id = callback.from_user.id
     
-    if user_id not in user_sessions or 'text_analysis_data' not in user_sessions[user_id]:
-        await callback.answer("Данные устарели. Выполните анализ заново.")
-        return
-    
-    text_data = user_sessions[user_id]['text_analysis_data']
-    analysis = text_data['analysis']
-    sentiment = analysis.get('sentiment', {})
-    
-    report = "<b>🎭 ДЕТАЛЬНЫЙ АНАЛИЗ ТОНАЛЬНОСТИ</b>\n\n"
-    
-    if sentiment:
-        score = sentiment.get('score', 0)
-        label = sentiment.get('label', 'neutral')
-        confidence = sentiment.get('confidence', 0)
+    try:
+        await cleanup_old_sessions()
         
-        # Визуализация тональности
-        if score > 0.3:
-            visual = "😊 " + "🟢" * int(score * 10) + "⚪" * int((1 - score) * 10)
-            interpretation = "Сильно позитивный текст"
-        elif score > 0.1:
-            visual = "🙂 " + "🟡" * int(score * 10) + "⚪" * int((1 - score) * 10)
-            interpretation = "Умеренно позитивный текст"
-        elif score > -0.1:
-            visual = "😐 " + "⚪" * 10
-            interpretation = "Нейтральный текст"
-        elif score > -0.3:
-            visual = "🙁 " + "🟠" * int(abs(score) * 10) + "⚪" * int((1 - abs(score)) * 10)
-            interpretation = "Умеренно негативный текст"
-        else:
-            visual = "😔 " + "🔴" * int(abs(score) * 10) + "⚪" * int((1 - abs(score)) * 10)
-            interpretation = "Сильно негативный текст"
+        if user_id not in user_sessions or 'text_analysis_data' not in user_sessions[user_id]:
+            await callback.answer("Данные устарели. Выполните анализ заново.", show_alert=True)
+            return
         
-        report += f"<b>Оценка тональности:</b> {score:.3f}\n"
-        report += f"<b>Визуализация:</b> {visual}\n"
-        report += f"<b>Интерпретация:</b> {interpretation}\n"
-        report += f"<b>Уверенность анализа:</b> {confidence:.1%}\n\n"
+        text_data = user_sessions[user_id]['text_analysis_data']
         
-        # Статистика по словам
-        report += f"<b>📊 СТАТИСТИКА:</b>\n"
-        report += f"• Позитивных слов: {sentiment.get('positive_words', 0)}\n"
-        report += f"• Негативных слов: {sentiment.get('negative_words', 0)}\n"
-        report += f"• Всего слов: {sentiment.get('total_words', 0)}\n\n"
+        # Проверяем, не устарели ли данные
+        if time.time() - text_data.get('created_at', 0) > 3600:
+            del user_sessions[user_id]
+            await callback.answer("Данные устарели. Выполните анализ заново.", show_alert=True)
+            return
         
-        # Рекомендации по тональности
-        report += "<b>💡 РЕКОМЕНДАЦИИ:</b>\n"
-        if score < -0.2:
-            report += "1. Добавьте больше позитивных формулировок\n"
-            report += "2. Избегайте резкой критики\n"
-            report += "3. Используйте конструктивные предложения\n"
-        elif score < 0:
-            report += "1. Сбалансируйте негативные и позитивные высказывания\n"
-            report += "2. Добавьте примеры успешных решений\n"
-            report += "3. Предложите пути улучшения\n"
-        elif score < 0.2:
-            report += "1. Текст хорошо сбалансирован\n"
-            report += "2. Можно добавить немного эмоциональности\n"
-            report += "3. Используйте больше конкретных примеров\n"
-        else:
-            report += "1. Отличная позитивная тональность!\n"
-            report += "2. Такие тексты хорошо воспринимаются аудиторией\n"
-            report += "3. Поддерживайте этот стиль\n"
-    
-    await callback.message.answer(report, reply_markup=create_back_button("back_to_text_analysis"))
-    await callback.answer()
+        analysis = text_data['analysis']
+        sentiment = analysis.get('sentiment', {})
+        
+        report = "<b>🎭 ДЕТАЛЬНЫЙ АНАЛИЗ ТОНАЛЬНОСТИ</b>\n\n"
+        
+        if sentiment:
+            score = sentiment.get('score', 0)
+            label = sentiment.get('label', 'neutral')
+            confidence = sentiment.get('confidence', 0)
+            
+            # Визуализация тональности
+            if score > 0.3:
+                visual = "😊 " + "🟢" * int(score * 10) + "⚪" * int((1 - score) * 10)
+                interpretation = "Сильно позитивный текст"
+            elif score > 0.1:
+                visual = "🙂 " + "🟡" * int(score * 10) + "⚪" * int((1 - score) * 10)
+                interpretation = "Умеренно позитивный текст"
+            elif score > -0.1:
+                visual = "😐 " + "⚪" * 10
+                interpretation = "Нейтральный текст"
+            elif score > -0.3:
+                visual = "🙁 " + "🟠" * int(abs(score) * 10) + "⚪" * int((1 - abs(score)) * 10)
+                interpretation = "Умеренно негативный текст"
+            else:
+                visual = "😔 " + "🔴" * int(abs(score) * 10) + "⚪" * int((1 - abs(score)) * 10)
+                interpretation = "Сильно негативный текст"
+            
+            report += f"<b>Оценка тональности:</b> {score:.3f}\n"
+            report += f"<b>Визуализация:</b> {visual}\n"
+            report += f"<b>Интерпретация:</b> {interpretation}\n"
+            report += f"<b>Уверенность анализа:</b> {confidence:.1%}\n\n"
+            
+            # Статистика по словам
+            report += f"<b>📊 СТАТИСТИКА:</b>\n"
+            report += f"• Позитивных слов: {sentiment.get('positive_words', 0)}\n"
+            report += f"• Негативных слов: {sentiment.get('negative_words', 0)}\n"
+            report += f"• Всего слов: {sentiment.get('total_words', 0)}\n\n"
+            
+            # Рекомендации по тональности
+            report += "<b>💡 РЕКОМЕНДАЦИИ:</b>\n"
+            if score < -0.2:
+                report += "1. Добавьте больше позитивных формулировок\n"
+                report += "2. Избегайте резкой критики\n"
+                report += "3. Используйте конструктивные предложения\n"
+            elif score < 0:
+                report += "1. Сбалансируйте негативные и позитивные высказывания\n"
+                report += "2. Добавьте примеры успешных решений\n"
+                report += "3. Предложите пути улучшения\n"
+            elif score < 0.2:
+                report += "1. Текст хорошо сбалансирован\n"
+                report += "2. Можно добавить немного эмоциональности\n"
+                report += "3. Используйте больше конкретных примеров\n"
+            else:
+                report += "1. Отличная позитивная тональность!\n"
+                report += "2. Такие тексты хорошо воспринимаются аудиторией\n"
+                report += "3. Поддерживайте этот стиль\n"
+        
+        await callback.message.answer(report, reply_markup=create_back_button("back_to_text_analysis"))
+        await callback.answer()
+        
+    except Exception as e:
+        logger.error(f"Ошибка в text_sentiment_callback: {e}")
+        await callback.answer("Произошла ошибка", show_alert=True)
 
 @dp.callback_query(F.data == "back_to_text_analysis")
 async def back_to_text_analysis(callback: CallbackQuery):
     """Возвращает к отчету по текстовому анализу"""
     user_id = callback.from_user.id
     
-    if user_id not in user_sessions or 'text_analysis_data' not in user_sessions[user_id]:
-        await callback.answer("Данные устарели")
-        return
-    
-    text_data = user_sessions[user_id]['text_analysis_data']
-    group_info = text_data['group_info']
-    analysis = text_data['analysis']
-    
-    await send_text_analysis_report(callback.message, group_info, analysis)
-    await callback.answer()
+    try:
+        await cleanup_old_sessions()
+        
+        if user_id not in user_sessions or 'text_analysis_data' not in user_sessions[user_id]:
+            await callback.answer("Данные устарели", show_alert=True)
+            return
+        
+        text_data = user_sessions[user_id]['text_analysis_data']
+        
+        # Проверяем, не устарели ли данные
+        if time.time() - text_data.get('created_at', 0) > 3600:
+            del user_sessions[user_id]
+            await callback.answer("Данные устарели", show_alert=True)
+            return
+        
+        group_info = text_data['group_info']
+        analysis = text_data['analysis']
+        
+        await send_text_analysis_report(callback.message, group_info, analysis)
+        await callback.answer()
+        
+    except Exception as e:
+        logger.error(f"Ошибка в back_to_text_analysis: {e}")
+        await callback.answer("Произошла ошибка", show_alert=True)
 
 @dp.message(Command("quick"))
 async def cmd_quick(message: Message, command: CommandObject = None):
@@ -1766,7 +1870,7 @@ async def cmd_compare(message: Message):
         
         # Общие характеристики
         if comparison['common_characteristics']:
-            report += "<b>🔗 ОБЩИЕ ХАРАКТЕРИСТИКИ:</b>\n"
+            report += "<b>🔗 ОБЩИЕ ХАРАКТЕРИСТИКЫ:</b>\n"
             for char in comparison['common_characteristics']:
                 report += f"• {char}\n"
         else:
@@ -1941,7 +2045,7 @@ async def text_analysis_help_callback(callback: CallbackQuery):
     await callback.message.answer(
         "🧠 <b>AI-анализ текста</b>\n\n"
         "Эта функция анализирует текстовый контент группы.\n\n"
-        "<b>Пример команды:</b>\n"
+        "<b>Пример команда:</b>\n"
         "<code>/text_analysis https://vk.com/public123</code>\n\n"
         "<b>Что анализирует бот:</b>\n"
         "• Тональность (позитивная/негативная/нейтральная)\n"
