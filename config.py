@@ -1,50 +1,47 @@
 import os
-from dotenv import load_dotenv
-
-load_dotenv()
+from typing import List
 
 class Config:
-    # Telegram
+    # Telegram Bot
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
+    
+    # Администраторы бота (список ID пользователей Telegram)
+    ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "1688115040").split(",") if x.strip().isdigit()]
     
     # VK API
-    VK_SERVICE_TOKEN = os.getenv("VK_SERVICE_TOKEN", "")
     VK_API_VERSION = "5.199"
+    VK_SERVICE_TOKEN = os.getenv("VK_SERVICE_TOKEN", "")
+    REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.34"))  # ~3 запроса в секунду
+    VK_API_TIMEOUT = int(os.getenv("VK_API_TIMEOUT", "30"))  # Таймаут в секундах
     
     # Database
-    DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///database.db")
+    DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///vk_analytics.db")
     
-    # Redis
-    REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    
-    # Limits
-    MAX_MEMBERS_PER_GROUP = 10000
-    REQUEST_DELAY = 0.34
-    
-    # Debug
-    DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+    # Logging
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
     
-    # VK API Configuration
-    VK_SERVICE_TOKEN = os.getenv("VK_SERVICE_TOKEN", "")
-    VK_API_VERSION = "5.199"
-    
-    # VK API Limits (запросов в секунду)
-    VK_REQUESTS_PER_SECOND = 3
-    REQUEST_DELAY = 1.0 / VK_REQUESTS_PER_SECOND  # ~0.33 секунды
-    
-    @classmethod
-    def validate(cls):
+    def validate(self):
+        """Валидация конфигурационных параметров"""
         errors = []
-        if not cls.TELEGRAM_BOT_TOKEN:
+        
+        if not self.TELEGRAM_BOT_TOKEN:
             errors.append("TELEGRAM_BOT_TOKEN не установлен")
-        if not cls.VK_SERVICE_TOKEN:
+        
+        if not self.VK_SERVICE_TOKEN:
             errors.append("VK_SERVICE_TOKEN не установлен")
-        if not cls.DATABASE_URL:
-            errors.append("DATABASE_URL не установлен")
+        
+        if self.REQUEST_DELAY < 0.34:
+            errors.append("REQUEST_DELAY должен быть не менее 0.34 для соблюдения лимитов VK API")
+        
+        if self.VK_API_TIMEOUT < 10:
+            errors.append("VK_API_TIMEOUT должен быть не менее 10 секунд")
+        
+        if not self.ADMIN_IDS:
+            errors.append("ADMIN_IDS не установлен - бот не будет иметь администраторов")
         
         if errors:
-            raise ValueError("Ошибки конфигурации:\n" + "\n".join(f"• {error}" for error in errors))
+            raise ValueError("; ".join(errors))
 
+
+# Создаем экземпляр конфигурации
 config = Config()
